@@ -1,0 +1,101 @@
+spring:
+  application:
+    name: schwab-url-shortener
+  mvc:
+    problemdetails:
+      enabled: true                # RFC 9457 bodies for framework errors (malformed JSON, wrong media type)
+
+  datasource:                      # ClickHouse, for click analytics only (docs/DESIGN.md §7.5)
+    url: ${CLICKHOUSE_URL:jdbc:clickhouse://localhost:8123/analytics}
+    username: ${CLICKHOUSE_USER:app}
+    password: ${CLICKHOUSE_PASSWORD:local}
+    hikari:
+      maximum-pool-size: 4
+      initialization-fail-timeout: -1   # start even if ClickHouse is down: redirects and links don't need it
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 200ms               # a slow cache must not slow redirects; fall back to DynamoDB
+      connect-timeout: 500ms
+      repositories:
+        enabled: false             # Redis is used as a cache only
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9094}
+    producer:
+      acks: 1
+      compression-type: lz4
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      properties:
+        linger.ms: 20              # batch click events
+        max.block.ms: 500          # never hold a redirect thread waiting for Kafka metadata
+        request.timeout.ms: 10000
+        delivery.timeout.ms: 30000   # must be >= linger.ms + request.timeout.ms, or the producer won't start
+    consumer:
+      # link-events invalidate local caches, so every instance needs every event: one group per instance
+      group-id: url-shortener-${HOSTNAME:local}
+      auto-offset-reset: latest     # a new instance's caches are empty, so it has nothing older to invalidate
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # A malformed message is logged and skipped instead of blocking the partition forever.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.schwab.assessment.*
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus   # nginx exposes only health; Prometheus scrapes each replica directly
+  endpoint:
+    health:
+      probes:
+        enabled: true                 # /actuator/health/liveness and /actuator/health/readiness
+      group:
+        readiness:
+          include: readinessState, dynamoDb   # Redis is a cache with a DynamoDB fallback, so it doesn't gate readiness
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true    # buckets for p50/p99 across replicas (histogram_quantile in Grafana)
+
+app:
+  redirect:                          # lookup tiers, docs/DESIGN.md §6.2
+    local-cache-size: 100000         # Caffeine entries per instance
+    local-cache-ttl: 60s             # also bounds staleness if a link-events invalidation is lost (§6.3)
+    redis-ttl: 24h
+    redis-ttl-jitter: 1h             # spread expiries so hot keys don't all reload at once
+    not-found-ttl: 30s               # unknown codes, in both tiers: bots scanning codes don't reach DynamoDB
+    redis-namespace: v1              # bump to invalidate every Redis link entry at once (§6.3)
+  analytics:                         # click processor, docs/DESIGN.md §6.4
+    consumer-group: click-processor  # shared by all instances, so they split the clicks partitions
+    visitor-salt-secret: ${ANALYTICS_VISITOR_SALT_SECRET:dev-only-visitor-salt-secret}   # set a real secret outside development
+    region: ${AWS_REGION:us-east-1}
+  relay:                             # DynamoDB Stream → link-events, docs/DESIGN.md §6.3
+    enabled: ${APP_RELAY_ENABLED:false}   # exactly one instance per region turns this on
+    poll-interval: 1s
+    shard-refresh: 30s
+  dynamodb:
+    endpoint: ${DYNAMODB_ENDPOINT:http://localhost:8000}   # DynamoDB Local; set to empty in AWS to use the regional endpoint
+    region: ${AWS_REGION:us-east-1}
+    table: ${DYNAMODB_TABLE:url_shortener}
+  links:
+    base-url: ${APP_BASE_URL:http://localhost:8080}
+    blocked-hosts: []                # e.g. [malware.example, phish.example]; subdomains are blocked too
+    reserved-aliases: [api, actuator, admin, lb-health, health, login, logout, static, docs]
+    id-block-size: 10000             # IDs leased per counter update (§6.1)
+    cursor-secret: ${LINKS_CURSOR_SECRET:dev-only-cursor-secret}   # signs list cursors (AP9); set a real secret outside development
+  rate-limit:                        # /api/** only, fixed windows in Redis; fails open if Redis is down (§9)
+    window: 1m
+    owner-writes: 60                 # creates, updates, deletes per owner: ~1/s sustained, ample for scripts
+    owner-reads: 600                 # gets, lists, stats per owner: separate, so polling stats can't block creates
+    client-ip: 300                   # per client IP, checked before the API key so key guessing is throttled
+  kafka:
+    topics:
+      clicks: clicks
+      link-events: link-events

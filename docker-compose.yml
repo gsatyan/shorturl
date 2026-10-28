@@ -1,0 +1,300 @@
+# Local environment for the URL shortener.
+#
+#   docker compose up -d                    # infrastructure only: DynamoDB Local, Kafka, Redis
+#   docker compose --profile app up -d --build   # + 2 app instances behind the nginx load balancer
+#   docker compose --profile app --profile monitoring up -d --build   # + Prometheus, Grafana and exporters
+#   docker compose --profile app --profile monitoring down -v        # stop and delete all data
+#
+# Host ports (bound to 127.0.0.1 only):
+#   8080   load balancer -> url-shortener instances
+#   8000   DynamoDB Local (aws dynamodb ... --endpoint-url http://localhost:8000, any credentials)
+#   9094   Kafka (for clients running on the host; containers use kafka:9092)
+#   6379   Redis
+#   8123   ClickHouse HTTP (user app, password local)
+#   9090   Prometheus (monitoring profile)
+#   3000   Grafana (monitoring profile; dashboard "URL Shortener overview", no login)
+
+name: schwab-url-shortener
+
+# DynamoDB Local accepts any credentials, but the AWS SDK and CLI refuse to start without some.
+x-aws-local: &aws-local
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: local
+  AWS_SECRET_ACCESS_KEY: local
+
+services:
+  dynamodb:
+    image: amazon/dynamodb-local:2.6.1
+    # -sharedDb: one database file for every credential and region, so the CLI and the app see the same table.
+    command: ["-jar", "DynamoDBLocal.jar", "-sharedDb", "-dbPath", "/home/dynamodblocal/data"]
+    user: root  # the named volume is created root-owned; development only
+    ports:  # no auth: development only
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - dynamodb-data:/home/dynamodblocal/data
+    healthcheck:
+      # Any HTTP response (an unsigned GET returns 400) means the server is up.
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://localhost:8000"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot job: creates the url_shortener table, GSI1 and stream from docker/dynamodb/url_shortener.json
+  # (the same definition as production, docs/DESIGN.md §7.1), enables TTL, seeds a dev owner and API key
+  # (Authorization: Bearer dev-local-api-key), then exits. Safe to re-run.
+  dynamodb-init:
+    image: amazon/aws-cli:2.27.50
+    depends_on:
+      dynamodb: { condition: service_healthy }
+    environment:
+      <<: *aws-local
+      AWS_PAGER: ""
+      DEV_API_KEY: ${DEV_API_KEY:-dev-local-api-key}   # override in .env; development only
+    volumes:
+      - ./docker/dynamodb:/dynamodb:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        endpoint=http://dynamodb:8000
+        if aws dynamodb describe-table --endpoint-url $$endpoint --table-name url_shortener > /dev/null 2>&1; then
+          echo "url_shortener already exists"
+        else
+          aws dynamodb create-table --endpoint-url $$endpoint --cli-input-json file:///dynamodb/url_shortener.json > /dev/null
+          aws dynamodb wait table-exists --endpoint-url $$endpoint --table-name url_shortener
+          echo "created url_shortener"
+        fi
+        # TTL only removes idempotency records; link items never carry the ttl attribute.
+        aws dynamodb update-time-to-live --endpoint-url $$endpoint --table-name url_shortener \
+          --time-to-live-specification "Enabled=true, AttributeName=ttl" > /dev/null 2>&1 \
+          || echo "TTL already enabled"
+        # Development owner and API key, so the API can be called right away (no endpoint issues keys yet).
+        # Only the key's SHA-256 is stored (docs/DESIGN.md §7.1). Development only.
+        now=$$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+        key_hash=$$(printf %s "$$DEV_API_KEY" | sha256sum | cut -d' ' -f1)
+        key_prefix=$$(printf %s "$$DEV_API_KEY" | cut -c1-8)
+        aws dynamodb put-item --endpoint-url $$endpoint --table-name url_shortener --condition-expression 'attribute_not_exists(pk)' \
+          --item "{\"pk\":{\"S\":\"OWNER#dev-owner\"},\"sk\":{\"S\":\"OWNER\"},\"ownerId\":{\"S\":\"dev-owner\"},\"externalSubject\":{\"S\":\"local-dev\"},\"createdAt\":{\"S\":\"$$now\"},\"status\":{\"S\":\"ACTIVE\"},\"verified\":{\"BOOL\":true}}" \
+          > /dev/null 2>&1 && echo "seeded owner dev-owner" || echo "owner dev-owner already exists"
+        aws dynamodb put-item --endpoint-url $$endpoint --table-name url_shortener --condition-expression 'attribute_not_exists(pk)' \
+          --item "{\"pk\":{\"S\":\"APIKEY#$$key_hash\"},\"sk\":{\"S\":\"APIKEY\"},\"gsi1pk\":{\"S\":\"OWNER#dev-owner\"},\"gsi1sk\":{\"S\":\"APIKEY#$$now\"},\"ownerId\":{\"S\":\"dev-owner\"},\"keyPrefix\":{\"S\":\"$$key_prefix\"},\"scopes\":{\"L\":[{\"S\":\"links:read\"},{\"S\":\"links:write\"}]},\"createdAt\":{\"S\":\"$$now\"}}" \
+          > /dev/null 2>&1 && echo "seeded dev API key ($$key_prefix...)" || echo "dev API key already exists"
+        aws dynamodb describe-table --endpoint-url $$endpoint --table-name url_shortener \
+          --query 'Table.{name: TableName, status: TableStatus, gsi: GlobalSecondaryIndexes[].IndexName, stream: StreamSpecification.StreamViewType}'
+    restart: "no"
+
+  # Single-node Kafka in KRaft mode (no ZooKeeper).
+  kafka:
+    image: apache/kafka:3.9.1
+    ports:
+      - "127.0.0.1:9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"  # topics come from kafka-init
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 15s
+
+  # One-shot job: creates the topics from the design (clicks, link-events), then exits.
+  kafka-init:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka: { condition: service_healthy }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        for topic in clicks link-events; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+            --create --if-not-exists --topic "$$topic" --partitions 3 --replication-factor 1
+        done
+        # Raw IPs and User-Agents exist only in clicks, so keep it 24 h (docs/DESIGN.md §2.2, §6.4, §9).
+        # Set with --alter rather than at create, so a topic left from an older volume gets it too.
+        /opt/kafka/bin/kafka-configs.sh --bootstrap-server kafka:9092 --alter \
+          --entity-type topics --entity-name clicks --add-config retention.ms=86400000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list
+    restart: "no"
+
+  # Redirect cache: memory only, evicts least-recently-used keys when full.
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Click analytics (docs/DESIGN.md §6.4, §7.5). The schema comes from docker/clickhouse/init.sql on first start.
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.3.46.2-alpine
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP interface: curl 'localhost:8123/?user=app&password=local' --data 'SELECT 1'
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: app
+      CLICKHOUSE_PASSWORD: local   # development only
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+    volumes:
+      - ./docker/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  url-shortener:
+    profiles: ["app"]
+    build: .
+    deploy:
+      replicas: 2                               # scale with: --scale url-shortener=N
+    environment:
+      <<: *aws-local
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      DYNAMODB_TABLE: url_shortener
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CLICKHOUSE_URL: jdbc:clickhouse://clickhouse:8123/analytics
+      SERVER_FORWARD_HEADERS_STRATEGY: native   # trust X-Forwarded-* from the load balancer
+    expose:  # reachable only through the load balancer
+      - "8080"
+    depends_on:
+      dynamodb-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      clickhouse: { condition: service_healthy }
+
+  # The stream relay (docs/DESIGN.md §6.3): the same image as url-shortener with the relay turned on.
+  # Exactly one copy, so each change is published once; not behind the load balancer.
+  relay:
+    profiles: ["app"]
+    build: .
+    environment:
+      <<: *aws-local
+      DYNAMODB_ENDPOINT: http://dynamodb:8000
+      DYNAMODB_TABLE: url_shortener
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      CLICKHOUSE_URL: jdbc:clickhouse://clickhouse:8123/analytics
+      APP_RELAY_ENABLED: "true"
+    expose:
+      - "8080"   # actuator only, for Prometheus
+    depends_on:
+      dynamodb-init: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+      kafka-init: { condition: service_completed_successfully }
+      clickhouse: { condition: service_healthy }
+
+  load-balancer:
+    profiles: ["app"]
+    image: nginx:1.28-alpine
+    ports:
+      - "127.0.0.1:8080:80"
+    volumes:
+      - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    expose:
+      - "8081"   # stub_status for nginx-exporter; compose network only
+    depends_on: [url-shortener]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/lb-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # --- Monitoring (docs/DESIGN.md §10) ---
+
+  prometheus:
+    profiles: ["monitoring"]
+    image: prom/prometheus:v3.13.5
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle      # reload config with: curl -X POST localhost:9090/-/reload
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  grafana:
+    profiles: ["monitoring"]
+    image: grafana/grafana:13.0.12
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # No login, everyone is admin: development only, bound to 127.0.0.1.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/url-shortener-overview.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus: { condition: service_healthy }
+
+  # Redis hit ratio, memory and evictions.
+  redis-exporter:
+    profiles: ["monitoring"]
+    image: oliver006/redis_exporter:v1.92.1
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis: { condition: service_healthy }
+
+  # Active connections and requests/s from the load balancer's stub_status.
+  nginx-exporter:
+    profiles: ["monitoring"]
+    image: nginx/nginx-prometheus-exporter:1.5.3
+    command: ["--nginx.scrape-uri=http://load-balancer:8081/stub_status"]
+    depends_on:
+      # Optional: without the app profile there is no load balancer, and nginx_up reports 0.
+      load-balancer: { condition: service_healthy, required: false }
+
+  # Consumer lag per group and topic: link-events lag means stale caches, clicks lag means delayed stats.
+  kafka-exporter:
+    profiles: ["monitoring"]
+    image: danielqsj/kafka-exporter:v1.10.0
+    command: ["--kafka.server=kafka:9092"]
+    restart: on-failure   # exits if Kafka isn't accepting connections yet
+    depends_on:
+      kafka: { condition: service_healthy }
+
+volumes:
+  dynamodb-data:
+  kafka-data:
+  clickhouse-data:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,8 @@
+# Test-only overrides, layered on top of src/main/resources/application.yaml (config/ takes precedence).
+app:
+  rate-limit:
+    # MockMvc sends every request from 127.0.0.1 and test classes share Redis, so the real limits would make unrelated
+    # tests throttle each other. RateLimitIntegrationTests sets its own low limits.
+    owner-writes: 1000000
+    owner-reads: 1000000
+    client-ip: 1000000

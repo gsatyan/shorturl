@@ -1,0 +1,10 @@
+apiVersion: 1
+
+# Loads every JSON file in docker/grafana/dashboards. Edit the files, not the UI: UI changes are lost on restart.
+providers:
+  - name: url-shortener
+    folder: URL Shortener
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
